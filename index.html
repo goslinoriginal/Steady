@@ -297,7 +297,7 @@ const defaultCats = () => [["Groceries",3500],["Eating out",1000],["Transport",1
 function defaultState(){
   return { v:1, setupDone:false, example:false, createdTs:Date.now(), updatedAt:0,
     zarSet:true, settings:{ currency:"ZAR", income:0, payday:25, hourly:0, savingsTarget:0, threshold:250, waitHours:48 },
-    bills:[], categories:defaultCats(), tx:[], wait:[], goals:[] };
+    bills:[], categories:defaultCats(), tx:[], wait:[], goals:[], income:[], adjust:[] };
 }
 function migrate(s){
   const d = defaultState();
@@ -351,11 +351,16 @@ function periodFor(t){
   return { start:new Date(y, m, d).getTime(), end:new Date(y, m + 1, d).getTime() };
 }
 const billsTotal = () => sum(S.bills, b => b.amount);
-const pool = () => S.settings.income - billsTotal() - S.settings.savingsTarget;
+const inPeriod = (t, p) => t >= p.start && t < p.end;
+// extra money in (minus the part set aside) and catch-up adjustments only count in their own pay period
+const extraIn = p => sum((S.income || []).filter(x => inPeriod(x.ts, p)), x => x.amt - (x.saved || 0));
+const adjustFor = p => sum((S.adjust || []).filter(x => inPeriod(x.ts, p)), x => x.amt);
+const basePool = () => S.settings.income - billsTotal() - S.settings.savingsTarget;
+const poolFor = p => basePool() + extraIn(p) - adjustFor(p);
 
 function daySeries(p, upto){
   // allowance and spend for each day of period p, up to and including day `upto`
-  const P = pool();
+  const P = poolFor(p);
   const ptx = S.tx.filter(t => t.ts >= p.start && t.ts < p.end);
   const total = daysBetween(p.start, p.end);
   const out = []; let cum = 0;
@@ -372,7 +377,9 @@ function daySeries(p, upto){
 
 function calc(){
   const now = Date.now(), today = sod(now), p = periodFor(now);
-  const P = pool();
+  const P = poolFor(p);
+  const incomes = (S.income || []).filter(x => inPeriod(x.ts, p)).sort((a,b) => b.ts - a.ts);
+  const extra = sum(incomes, x => x.amt), extraSaved = sum(incomes, x => x.saved || 0), adjust = adjustFor(p);
   const ptx = S.tx.filter(t => t.ts >= p.start && t.ts < p.end);
   const spent = sum(ptx, t => t.amt);
   const spentToday = sum(ptx.filter(t => t.ts >= today), t => t.amt);
@@ -407,7 +414,7 @@ function calc(){
   const skipped = S.wait.filter(w => w.status === "skipped");
   const savedByWaiting = sum(skipped, w => w.amt);
   const elapsed = (daysTotal - daysLeft) / daysTotal;
-  return { p, P, ptx, spent, spentToday, allowance, safe, remaining, tomorrow, daysLeft, daysTotal, needs, wants, toGoals, byCat, series, streak, noSpend, savedByWaiting, skippedCount:skipped.length, elapsed, today };
+  return { incomes, extra, extraSaved, adjust, p, P, ptx, spent, spentToday, allowance, safe, remaining, tomorrow, daysLeft, daysTotal, needs, wants, toGoals, byCat, series, streak, noSpend, savedByWaiting, skippedCount:skipped.length, elapsed, today };
 }
 
 /* ---------- render ---------- */
@@ -444,7 +451,7 @@ function renderToday(c){
   if (c.P <= 0){
     return `<div class="hero"><div class="label">Safe to spend today</div><div class="big bad num">${money(0)}</div>
       <p class="muted">Your bills and savings add up to more than your income, so there's no spending money this period.</p>
-      <button class="btn primary block" data-tab="budget">Review my budget</button></div>`;
+      <div class="sheet-btns"><button class="btn primary block" data-act="catchup">Set what I have left</button><button class="btn block" data-act="income">Add money in</button><button class="btn ghost block" data-tab="budget">Review my budget</button></div></div>`;
   }
   const pct = c.allowance > 0 ? Math.min(100, c.spentToday / c.allowance * 100) : 100;
   let state = "good", label = "On track";
@@ -463,12 +470,14 @@ function renderToday(c){
     <div class="muted small">${c.safe<0?"over":"left"} of your ${money(c.allowance)} for today</div>
     <div class="meter ${state==="good"?"":state}"><b style="width:${pct}%"></b></div>
     <div class="hero-foot"><span>Spent today <b class="num">${money(c.spentToday)}</b></span><span>${c.daysLeft} day${c.daysLeft===1?"":"s"} until payday</span></div>
+    <div style="margin-top:10px"><button class="link" style="font-size:13px" data-act="catchup">Numbers don't match your bank? Set what you have left</button></div>
     ${c.safe < 0 ? `<div class="over-note">Going over today shrinks every day after it. Tomorrow's allowance is now <b>${money(c.tomorrow)}</b>.</div>` : ""}
   </section>
 
   <div class="actions">
     <button class="btn primary" data-act="add">${ico("plus",18)} Log spending</button>
     <button class="btn want" data-act="want">${ico("wait",18)} I want something</button>
+    <button class="btn ghost" data-act="income" style="grid-column:1/-1;min-height:44px">${ico("plus",16)} Money in: gift, sale, side job</button>
   </div>
 
   <div class="stats">
@@ -565,13 +574,21 @@ function renderBudget(c){
     <div class="calc-line"><span>Monthly income</span><span class="num">${money(st.income)}</span></div>
     <div class="calc-line"><span>Bills and subscriptions</span><span class="num">− ${money(billsTotal())}</span></div>
     <div class="calc-line"><span>Saving each month</span><span class="num">− ${money(st.savingsTarget)}</span></div>
-    <div class="calc-line total"><span>Spending money</span><span class="num" style="${c.P<0?"color:var(--bad)":""}">${money(c.P)}</span></div>
-    <p class="muted small" style="margin:8px 0 0">Spending money is split evenly across the days until payday. That's where your daily number comes from.</p>
+    ${c.extra ? `<div class="calc-line"><span>Extra money in</span><span class="num">+ ${money(c.extra)}</span></div>` : ""}
+    ${c.extraSaved ? `<div class="calc-line"><span>Extra money saved</span><span class="num">− ${money(c.extraSaved)}</span></div>` : ""}
+    ${c.adjust ? `<div class="calc-line"><span>Already spent (from catch-up)</span><span class="num">${c.adjust>0?"− ":"+ "}${money(Math.abs(c.adjust))}</span></div>` : ""}
+    <div class="calc-line total"><span>Spending money this period</span><span class="num" style="${c.P<0?"color:var(--bad)":""}">${money(c.P)}</span></div>
+    <p class="muted small" style="margin:8px 0 12px">Spending money is split evenly across the days until payday. That's where your daily number comes from.</p>
+    <div class="two"><button class="btn" data-act="catchup">Set what I have left</button><button class="btn" data-act="income">Add money in</button></div>
   </section>
+
+  ${c.incomes.length ? `<section class="card"><div class="section-head"><h2>Money in this period</h2><span class="num muted small">+ ${money(c.extra)}</span></div><div class="rows">
+    ${c.incomes.map(x => `<div class="row"><span class="dot need"></span><div class="main"><div class="t">${esc(x.note || "Extra money")}</div><div class="d">${fmtDay(x.ts)}${x.saved ? " · " + money(x.saved) + " saved" + (x.goal ? " to " + esc((S.goals.find(g => g.id === x.goal) || {}).name || "a goal") : "") : ""}</div></div><div class="amt" style="color:var(--accent)">+${money(x.amt)}</div><button class="del" data-del-inc="${x.id}">Delete</button></div>`).join("")}
+  </div></section>` : ""}
 
   <section class="card">
     <div class="section-head"><h2>Categories</h2><button class="link" data-act="add-cat">Add</button></div>
-    <p class="muted small" style="margin:-4px 0 10px">Limits add up to ${money(catTotal)} of ${money(c.P)}.${catTotal > c.P ? ` <b style="color:var(--bad)">That's more than you have.</b>` : ""} Tap one to change it.</p>
+    <p class="muted small" style="margin:-4px 0 10px">Limits add up to ${money(catTotal)} of your usual ${money(basePool())} a month.${catTotal > basePool() ? ` <b style="color:var(--bad)">That's more than you have.</b>` : ""} Tap one to change it.</p>
     <div class="rows">
     ${S.categories.map(cat => {
       const sp = c.byCat[cat.id] || 0;
@@ -723,14 +740,16 @@ function renderOnboarding(){
       <label class="field"><span>Save each month</span><input class="input num" id="ob-save" inputmode="decimal" placeholder="e.g. 1500" value="${esc(draft.savingsTarget)}"></label>
       <label class="field"><span>What you earn per hour (optional)</span><input class="input num" id="ob-hourly" inputmode="decimal" placeholder="e.g. 120" value="${esc(draft.hourly)}"></label>
       <p class="muted small" style="margin:-6px 0 14px">Steady uses this to show prices as hours of your life. R900 sneakers feel different as "7 hours of work".</p>
-      <div class="preview" id="ob-preview">${flex > 0 ? `<div class="label" style="color:var(--accent)">Your daily allowance would be about</div><div class="v num">${money(flex/ (daysBetween(p.start,p.end)) )}</div><div class="small muted">${money(flex)} of spending money per month · ${days} day${days===1?"":"s"} to your next payday</div>` : `<div class="label" style="color:var(--bad)">Bills and savings are more than your income</div><div class="small muted">Lower the savings amount or recheck your bills.</div>`}</div>
-      <div class="two"><button class="btn" data-ob="back">Back</button><button class="btn primary" data-ob="finish" ${flex>0?"":"disabled"}>Start budgeting</button></div>
+      <label class="field"><span>Part-way through the month? What's left to spend until payday (optional)</span><input class="input num" id="ob-left" inputmode="decimal" placeholder="e.g. 537.80" value="${esc(draft.left||"")}"></label>
+      <p class="muted small" style="margin:-6px 0 14px">Fill this in and you won't have to log what you've already spent this month. Leave out bills you still have to pay before payday.</p>
+      <div class="preview" id="ob-preview">${num(draft.left) > 0 ? `<div class="label" style="color:var(--accent)">Until payday you can spend about</div><div class="v num">${money(num(draft.left)/Math.max(1,days))} a day</div><div class="small muted">${money(num(draft.left))} left · ${days} day${days===1?"":"s"} to payday${flex > 0 ? ` · after that about ${money(flex/daysBetween(p.start,p.end))} a day` : ""}</div>` : flex > 0 ? `<div class="label" style="color:var(--accent)">Your daily allowance would be about</div><div class="v num">${money(flex/ (daysBetween(p.start,p.end)) )}</div><div class="small muted">${money(flex)} of spending money per month · ${days} day${days===1?"":"s"} to your next payday</div>` : `<div class="label" style="color:var(--bad)">Bills and savings are more than your income</div><div class="small muted">Lower the savings amount or recheck your bills.</div>`}</div>
+      <div class="two"><button class="btn" data-ob="back">Back</button><button class="btn primary" data-ob="finish" ${flex>0||num(draft.left)>0?"":"disabled"}>Start budgeting</button></div>
     </div></section>`;
 }
 function readOnb(){
   const g = id => { const el = document.getElementById(id); return el ? el.value : undefined; };
   if (onbStep === 0){ draft.income = g("ob-income"); draft.payday = g("ob-payday"); draft.currency = g("ob-currency"); }
-  if (onbStep === 2){ draft.savingsTarget = g("ob-save"); draft.hourly = g("ob-hourly"); }
+  if (onbStep === 2){ draft.savingsTarget = g("ob-save"); draft.hourly = g("ob-hourly"); draft.left = g("ob-left"); }
 }
 function bindOnboarding(){
   const v = $("#view");
@@ -749,6 +768,8 @@ function finishOnb(){
   S.settings.hourly = num(draft.hourly);
   S.bills = draft.bills.filter(b => b.name.trim() && num(b.amount) > 0).map(b => ({ id:b.id, name:b.name.trim(), amount:num(b.amount), day:Math.min(31, Math.max(1, num(b.day) || 1)) }));
   S.setupDone = true; S.example = false; S.createdTs = Date.now();
+  S.tx = []; S.income = []; S.adjust = [];
+  if (num(draft.left) > 0){ const c = calc(); S.adjust = [{ id:uid(), amt:r2(c.remaining - num(draft.left)), ts:c.p.start }]; }
   draft = null; onbStep = 0; tab = "today";
   commit("You're set. Here's what's safe to spend today.");
 }
@@ -784,6 +805,8 @@ function loadExample(){
     { id:uid(), name:"Concert tickets", amt:650, addedTs:Date.now()-12*DAY, readyTs:Date.now()-10*DAY, status:"bought", decidedTs:Date.now()-10*DAY }
   ];
   s.goals = [{ id:uid(), name:"Emergency fund", target:15000, saved:5200 }, { id:uid(), name:"December holiday", target:8000, saved:1800 }];
+  s.income = [{ id:uid(), amt:1200, saved:600, goal:s.goals[0].id, note:"Sold old bike", ts:addDays(today,-3) + 15*36e5 }];
+  s.goals[0].saved += 600;
   draft = null; onbStep = 0; tab = "today";
   commit("Example data loaded");
 }
@@ -950,6 +973,81 @@ function sheetSkip(id){
       if (b){ const g = S.goals.find(x => x.id === b.dataset.to); g.saved = r2(g.saved + w.amt); S.tx.push({ id:uid(), amt:w.amt, cat:null, kind:"goal", goal:g.id, note:"", ts:Date.now() }); closeSheet(); commit(money(w.amt) + " moved to " + g.name); }
     });
     sh.querySelector("#s-keep").onclick = () => { closeSheet(); commit("Skipped. Nice work."); };
+  });
+}
+
+function sheetCatchup(){
+  const c = calc();
+  const sym = esc(curSymbol());
+  openSheet(`
+    <h2>Set what you have left</h2>
+    <p class="sub">No need to log everything you've already spent. Tell Steady what's left until payday and it works out the rest.</p>
+    <div class="field"><span>Left to spend until payday</span><div class="amount-wrap"><span>${sym}</span><input id="cu-amt" inputmode="decimal" placeholder="0" autofocus aria-label="Amount left"></div></div>
+    <div class="hint">Check your bank balance and take off any bills you still have to pay before payday. Right now Steady thinks you have <b>${money(c.remaining)}</b> left.</div>
+    <div id="cu-hint"></div>
+    <button class="btn primary block" id="cu-save" disabled>Enter an amount</button>
+  `, sh => {
+    const a = sh.querySelector("#cu-amt"), hint = sh.querySelector("#cu-hint"), save = sh.querySelector("#cu-save");
+    a.addEventListener("input", () => {
+      const v = num(a.value), ok = a.value.trim() !== "" && v >= 0;
+      save.disabled = !ok;
+      save.textContent = ok ? "Set to " + money(v) : "Enter an amount";
+      const daily = (v + c.spentToday) / c.daysLeft;
+      hint.innerHTML = ok ? `<div class="hint ${daily < 50 ? "warn" : ""}">That's about <b>${money(daily)}</b> a day for the next ${c.daysLeft} day${c.daysLeft===1?"":"s"}.${daily < 50 ? " Tight, but doable. The wait list is your friend this week." : ""}</div>` : "";
+    });
+    save.onclick = () => {
+      const v = r2(num(a.value));
+      const newAdj = r2(adjustFor(c.p) + (c.remaining - v));
+      S.adjust = (S.adjust || []).filter(x => !inPeriod(x.ts, c.p));
+      if (Math.abs(newAdj) > 0.004) S.adjust.push({ id:uid(), amt:newAdj, ts:c.p.start });
+      closeSheet(); commit("Done. You have " + money(v) + " until payday.");
+    };
+  });
+}
+
+function sheetIncome(){
+  const sym = esc(curSymbol());
+  const goals = S.goals.filter(g => g.saved < g.target);
+  let share = 0.5, goalId = goals[0] ? goals[0].id : null;
+  openSheet(`
+    <h2>Money in</h2>
+    <p class="sub">A gift, something you sold, a side job. It's added to what you can spend this pay period.</p>
+    <div class="field"><div class="amount-wrap"><span>${sym}</span><input id="i-amt" inputmode="decimal" placeholder="0" autofocus aria-label="Amount"></div></div>
+    <label class="field"><span>Where's it from?</span><input class="input" id="i-note" placeholder="e.g. Christmas money from my parents"></label>
+    <div class="field"><span>Save some before you spend it?</span><div class="chips" id="i-share">${[[0,"Spend it all"],[0.25,"Save a quarter"],[0.5,"Save half"],[1,"Save it all"]].map(([v,l]) => `<button data-share="${v}" aria-pressed="${v===share}">${l}</button>`).join("")}</div></div>
+    ${goals.length ? `<div class="field" id="i-goal-wrap"><span>Save it into</span><div class="chips">${goals.map(g => `<button data-goal="${g.id}" aria-pressed="${g.id===goalId}">${esc(g.name)}</button>`).join("")}</div></div>` : ""}
+    <div id="i-hint"></div>
+    <button class="btn primary block" id="i-save" disabled>Enter an amount</button>
+  `, sh => {
+    const a = sh.querySelector("#i-amt"), hint = sh.querySelector("#i-hint"), save = sh.querySelector("#i-save");
+    const upd = () => {
+      const v = num(a.value), c = calc();
+      sh.querySelectorAll("[data-share]").forEach(b => b.setAttribute("aria-pressed", +b.dataset.share === share));
+      sh.querySelectorAll("[data-goal]").forEach(b => b.setAttribute("aria-pressed", b.dataset.goal === goalId));
+      const gw = sh.querySelector("#i-goal-wrap"); if (gw) gw.hidden = share === 0;
+      save.disabled = !(v > 0);
+      save.textContent = v > 0 ? "Add " + money(v) : "Enter an amount";
+      if (v > 0){
+        const saved = r2(v * share), spend = r2(v - saved);
+        const g = S.goals.find(x => x.id === goalId);
+        hint.innerHTML = `<div class="hint">${spend > 0 ? `<b>${money(spend)}</b> goes to spending money, about <b>${money(spend / c.daysLeft)}</b> more a day until payday.` : "None of it goes to spending money."}${saved > 0 ? ` <b>${money(saved)}</b> ${g ? "goes to " + esc(g.name) : "is set aside as savings"}.` : ""}${share === 0 && v >= 300 ? " Saving even part of it now means future you gets some too." : ""}</div>`;
+      } else hint.innerHTML = "";
+    };
+    sh.addEventListener("click", e => {
+      const s = e.target.closest("[data-share]"); if (s){ share = +s.dataset.share; upd(); }
+      const g = e.target.closest("[data-goal]"); if (g){ goalId = g.dataset.goal; upd(); }
+    });
+    a.addEventListener("input", upd);
+    save.onclick = () => {
+      const v = r2(num(a.value)); if (!(v > 0)) return;
+      const saved = r2(v * share);
+      const g = saved > 0 ? S.goals.find(x => x.id === goalId) : null;
+      if (g) g.saved = r2(g.saved + saved);
+      if (!S.income) S.income = [];
+      S.income.push({ id:uid(), amt:v, saved, goal:g ? g.id : null, note:sh.querySelector("#i-note").value.trim(), ts:Date.now() });
+      closeSheet(); commit(saved > 0 ? "Added. " + money(saved) + " saved." : "Added " + money(v));
+    };
+    upd();
   });
 }
 
@@ -1124,6 +1222,14 @@ document.addEventListener("click", e => {
   if (d.obRm){ draft.bills = draft.bills.filter(b => b.id !== d.obRm); render(); return; }
   if (d.act === "add") return sheetAdd();
   if (d.act === "want") return sheetWant();
+  if (d.act === "catchup") return sheetCatchup();
+  if (d.act === "income") return sheetIncome();
+  if (d.delInc){
+    if (!t.classList.contains("confirm")){ t.classList.add("confirm"); t.textContent = "Sure?"; setTimeout(() => { if (t.isConnected){ t.classList.remove("confirm"); t.textContent = "Delete"; } }, 3000); return; }
+    const x = (S.income || []).find(i => i.id === d.delInc);
+    if (x && x.goal && x.saved){ const g = S.goals.find(g => g.id === x.goal); if (g) g.saved = r2(Math.max(0, g.saved - x.saved)); }
+    S.income = S.income.filter(i => i.id !== d.delInc); commit("Deleted"); return;
+  }
   if (d.act === "settings") return sheetSettings();
   if (d.act === "add-cat") return sheetCat();
   if (d.act === "add-bill") return sheetBill();
