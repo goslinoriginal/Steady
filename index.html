@@ -151,9 +151,12 @@ h2{font-size:1.15rem;font-weight:700}
 
 /* sheets */
 .overlay{position:fixed;inset:0;background:rgba(8,14,11,.45);z-index:40;display:flex;align-items:flex-end;justify-content:center;animation:fade .15s ease}
-.sheet{background:var(--surface);width:100%;max-width:560px;border-radius:22px 22px 0 0;max-height:92%;overflow:auto;
-  padding:10px max(18px,env(safe-area-inset-right,0px)) calc(22px + env(safe-area-inset-bottom,0px)) max(18px,env(safe-area-inset-left,0px));animation:up .2s ease}
-.grab{width:40px;height:5px;border-radius:9px;background:var(--line);margin:0 auto 12px}
+.sheet{background:var(--surface);width:100%;max-width:560px;border-radius:22px 22px 0 0;max-height:92%;overflow:auto;position:relative;
+  padding:0 max(18px,env(safe-area-inset-right,0px)) calc(22px + env(safe-area-inset-bottom,0px)) max(18px,env(safe-area-inset-left,0px));animation:up .2s ease}
+.grab{width:40px;height:5px;border-radius:9px;background:var(--line)}
+.sheet-bar{position:sticky;top:0;z-index:3;background:var(--surface);display:flex;align-items:center;justify-content:center;height:52px;margin-bottom:2px}
+.sheet-x{position:absolute;right:-6px;top:8px;width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:var(--surface-2);display:grid;place-items:center;padding:0}
+.sheet-x svg{stroke:var(--ink)}
 .sheet h2{font-size:1.35rem;margin-bottom:4px}
 .sheet .sub{color:var(--muted);font-size:14px;margin-bottom:14px}
 @keyframes up{from{transform:translateY(30px);opacity:.4}to{transform:none;opacity:1}}
@@ -850,19 +853,29 @@ function loadExample(){
 }
 
 /* ---------- sheets ---------- */
-let sheetCleanup = null;
+let sheetCleanup = null, sheetHist = false, ignorePop = false;
+// Each open pop-up adds one history entry, so the phone's back button/gesture closes it instead of leaving the app.
+window.addEventListener("popstate", () => {
+  if (ignorePop){ ignorePop = false; return; }
+  if (sheetHist){ sheetHist = false; closeSheet(true); }
+});
 function openSheet(html, mount){
-  closeSheet();
+  closeSheet(true);
+  if (!sheetHist){ try { history.pushState({ steadySheet:1 }, ""); sheetHist = true; } catch {} }
   const ov = document.createElement("div");
   ov.className = "overlay"; ov.id = "overlay";
-  ov.innerHTML = `<div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div>`;
-  ov.addEventListener("click", e => { if (e.target === ov) closeSheet(); });
+  ov.innerHTML = `<div class="sheet" role="dialog" aria-modal="true"><div class="sheet-bar"><div class="grab"></div><button class="sheet-x" aria-label="Close"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>${html}</div>`;
+  ov.addEventListener("click", e => { if (e.target === ov || e.target.closest(".sheet-x")) closeSheet(); });
   document.body.appendChild(ov);
-  const first = ov.querySelector("[autofocus]") || ov.querySelector("input,select,textarea,button");
+  const first = ov.querySelector("[autofocus]") || ov.querySelector(".sheet input, .sheet select, .sheet textarea");
   if (first) setTimeout(() => first.focus(), 30);
   sheetCleanup = mount ? mount(ov.querySelector(".sheet")) : null;
 }
-function closeSheet(){ const ov = $("#overlay"); if (ov) ov.remove(); if (typeof sheetCleanup === "function") sheetCleanup(); sheetCleanup = null; }
+function closeSheet(keepHistory){
+  const ov = $("#overlay"); if (ov) ov.remove();
+  if (typeof sheetCleanup === "function") sheetCleanup(); sheetCleanup = null;
+  if (!keepHistory && sheetHist){ sheetHist = false; ignorePop = true; try { history.back(); } catch { ignorePop = false; } }
+}
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeSheet(); });
 
 function toast(msg){
@@ -990,7 +1003,7 @@ function sheetBuy(id){
       S.tx.push({ id:uid(), amt:w.amt, cat, kind:"want", note:w.name, ts:Date.now() });
       closeSheet(); commit("Logged " + money(w.amt) + ". Enjoy it.");
     };
-    sh.querySelector("#b-no").onclick = () => { closeSheet(); sheetSkip(id); };
+    sh.querySelector("#b-no").onclick = () => sheetSkip(id);
   });
 }
 
