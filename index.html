@@ -297,7 +297,7 @@ const defaultCats = () => [["Groceries",3500],["Eating out",1000],["Transport",1
 function defaultState(){
   return { v:1, setupDone:false, example:false, createdTs:Date.now(), updatedAt:0,
     zarSet:true, settings:{ currency:"ZAR", income:0, payday:25, hourly:0, savingsTarget:0, threshold:250, waitHours:48 },
-    bills:[], categories:defaultCats(), tx:[], wait:[], goals:[], income:[], adjust:[] };
+    bills:[], categories:defaultCats(), tx:[], wait:[], goals:[], income:[], adjust:[], balances:null };
 }
 function migrate(s){
   const d = defaultState();
@@ -373,6 +373,22 @@ function daySeries(p, upto){
     cum += s;
   }
   return out;
+}
+
+// Bank and savings: start from the last balances the person typed in, then apply what happened since:
+// logged spending, money in, transfers to goals, salary on payday (minus the monthly savings) and bills on their due day.
+function balances(){
+  const b = S.balances; if (!b) return null;
+  let bank = b.bank, sav = b.savings, changes = 0;
+  S.tx.forEach(t => { if (t.ts > b.ts){ bank -= t.amt; if (t.kind === "goal") sav += t.amt; changes++; } });
+  (S.income || []).forEach(x => { if (x.ts > b.ts){ bank += x.amt - (x.saved || 0); sav += (x.saved || 0); changes++; } });
+  const today = sod(Date.now()), payday = Math.min(28, Math.max(1, S.settings.payday | 0 || 1));
+  for (let day = addDays(sod(b.ts), 1), n = 0; day <= today && n < 800; day = addDays(day, 1), n++){
+    const dt = new Date(day), date = dt.getDate(), last = new Date(dt.getFullYear(), dt.getMonth() + 1, 0).getDate();
+    if (date === payday){ bank += S.settings.income - S.settings.savingsTarget; sav += S.settings.savingsTarget; changes++; }
+    S.bills.forEach(bl => { if (Math.min(last, bl.day | 0 || 1) === date){ bank -= bl.amount; changes++; } });
+  }
+  return { bank:r2(bank), savings:r2(sav), ts:b.ts, changes };
 }
 
 function calc(){
@@ -486,6 +502,8 @@ function renderToday(c){
     <div class="stat"><div class="label">Not wasted</div><div class="v num">${money(c.savedByWaiting,{whole:true})}</div><div class="s">skipped after waiting</div></div>
   </div>
 
+  ${moneyCard()}
+
   ${readyItems.length ? `<section class="card"><div class="section-head"><h2>Time to decide</h2><button class="link" data-tab="wait">Open wait list</button></div>
     <p class="muted small" style="margin:0 0 10px">The waiting period is over for ${readyItems.length===1?"this item":"these items"}. Still want ${readyItems.length===1?"it":"them"}?</p>
     <div class="stack">${readyItems.slice(0,2).map(waitCard).join("")}</div></section>` : ""}
@@ -505,6 +523,25 @@ function renderToday(c){
 
   <section class="card"><div class="section-head"><h2>Today's spending</h2>${todayTx.length?`<span class="num muted small">${money(c.spentToday)}</span>`:""}</div>
     ${todayTx.length ? `<div class="rows">${todayTx.map(txRow).join("")}</div>` : `<div class="empty"><strong>Nothing spent yet today</strong>Get through the day with nothing logged and it counts as a no-spend day.</div>`}
+  </section>`;
+}
+
+function ago(t){
+  const d = daysBetween(t, Date.now());
+  return d <= 0 ? "today" : d === 1 ? "yesterday" : d + " days ago";
+}
+function moneyCard(){
+  const b = balances();
+  if (!b) return `<section class="card"><div class="section-head"><h2>Your money</h2></div>
+    <p class="muted small" style="margin:0 0 12px">Add what's in your bank and savings accounts to see them here. Steady keeps them up to date as you log spending, get paid and pay bills.</p>
+    <button class="btn block" data-act="balances">Add my balances</button></section>`;
+  const inGoals = sum(S.goals, g => Math.min(g.saved, g.target));
+  return `<section class="card"><div class="section-head"><h2>Your money</h2><button class="link" data-act="balances">Update</button></div>
+    <div class="two">
+      <div class="stat"><div class="label">Bank</div><div class="v num" style="${b.bank<0?"color:var(--bad)":""}">${money(b.bank,{whole:true})}</div><div class="s">current account</div></div>
+      <div class="stat"><div class="label">Savings</div><div class="v num" style="color:var(--accent)">${money(b.savings,{whole:true})}</div><div class="s">${inGoals > 0 ? money(inGoals,{whole:true}) + " set for goals" : "put away"}</div></div>
+    </div>
+    <p class="muted small" style="margin:10px 0 0">${b.changes ? `You updated these ${ago(b.ts)}. Since then Steady has added and taken off what you've logged, paydays and bills. If it doesn't match your bank app, tap Update.` : `Updated ${ago(b.ts)}.`}</p>
   </section>`;
 }
 
@@ -807,6 +844,7 @@ function loadExample(){
   s.goals = [{ id:uid(), name:"Emergency fund", target:15000, saved:5200 }, { id:uid(), name:"December holiday", target:8000, saved:1800 }];
   s.income = [{ id:uid(), amt:1200, saved:600, goal:s.goals[0].id, note:"Sold old bike", ts:addDays(today,-3) + 15*36e5 }];
   s.goals[0].saved += 600;
+  s.balances = { bank:3200, savings:7000, ts:addDays(today,-4) + 10*36e5 };
   draft = null; onbStep = 0; tab = "today";
   commit("Example data loaded");
 }
@@ -973,6 +1011,26 @@ function sheetSkip(id){
       if (b){ const g = S.goals.find(x => x.id === b.dataset.to); g.saved = r2(g.saved + w.amt); S.tx.push({ id:uid(), amt:w.amt, cat:null, kind:"goal", goal:g.id, note:"", ts:Date.now() }); closeSheet(); commit(money(w.amt) + " moved to " + g.name); }
     });
     sh.querySelector("#s-keep").onclick = () => { closeSheet(); commit("Skipped. Nice work."); };
+  });
+}
+
+function sheetBalances(){
+  const b = balances();
+  const sym = esc(curSymbol());
+  openSheet(`
+    <h2>Your balances</h2>
+    <p class="sub">Open your banking app and copy the numbers in. Steady keeps them updated from here.</p>
+    <div class="field"><span>Bank (current / cheque account)</span><div class="amount-wrap"><span>${sym}</span><input id="bl-bank" inputmode="decimal" placeholder="0" autofocus value="${b ? b.bank : ""}" aria-label="Bank balance"></div></div>
+    <div class="field"><span>Savings</span><div class="amount-wrap"><span>${sym}</span><input id="bl-sav" inputmode="decimal" placeholder="0" value="${b ? b.savings : ""}" aria-label="Savings balance"></div></div>
+    <p class="muted small" style="margin:-4px 0 14px">After this, the bank number goes down when you log spending or a bill is due, and goes up on payday and when you add money in. Savings go up when you save.</p>
+    <button class="btn primary block" id="bl-save">Save balances</button>
+  `, sh => {
+    sh.querySelector("#bl-save").onclick = () => {
+      const bank = sh.querySelector("#bl-bank").value, sav = sh.querySelector("#bl-sav").value;
+      if (bank.trim() === "" && sav.trim() === ""){ sh.querySelector("#bl-bank").focus(); return; }
+      S.balances = { bank:r2(num(bank)), savings:r2(num(sav)), ts:Date.now() };
+      closeSheet(); commit("Balances saved");
+    };
   });
 }
 
@@ -1223,6 +1281,7 @@ document.addEventListener("click", e => {
   if (d.act === "add") return sheetAdd();
   if (d.act === "want") return sheetWant();
   if (d.act === "catchup") return sheetCatchup();
+  if (d.act === "balances") return sheetBalances();
   if (d.act === "income") return sheetIncome();
   if (d.delInc){
     if (!t.classList.contains("confirm")){ t.classList.add("confirm"); t.textContent = "Sure?"; setTimeout(() => { if (t.isConnected){ t.classList.remove("confirm"); t.textContent = "Delete"; } }, 3000); return; }
