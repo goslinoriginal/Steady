@@ -1,5 +1,5 @@
 // Bump VERSION whenever you change the app so phones pick up the new files.
-const VERSION = "steady-v3";
+const VERSION = "steady-v4";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {

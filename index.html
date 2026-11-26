@@ -300,7 +300,7 @@ const defaultCats = () => [["Groceries",3500],["Eating out",1000],["Transport",1
 function defaultState(){
   return { v:1, setupDone:false, example:false, createdTs:Date.now(), updatedAt:0,
     zarSet:true, settings:{ currency:"ZAR", income:0, payday:25, hourly:0, savingsTarget:0, threshold:250, waitHours:48 },
-    bills:[], categories:defaultCats(), tx:[], wait:[], goals:[], income:[], adjust:[], balances:null };
+    bills:[], categories:defaultCats(), tx:[], wait:[], goals:[], income:[], adjust:[], balances:null, payOverrides:{}, payTaps:{} };
 }
 function migrate(s){
   const d = defaultState();
@@ -346,12 +346,21 @@ if ("serviceWorker" in navigator){
 }
 
 /* ---------- math ---------- */
+// Pay periods run from payday to payday. If salary arrives early, the person taps "I got paid today"
+// and that month's payday moves to the day they tapped it (stored in S.payOverrides, keyed by the scheduled month).
+const paydayNum = () => Math.min(28, Math.max(1, (S.settings.payday | 0) || 1));
+const payKey = (y, m) => { const dt = new Date(y, m, 1); return dt.getFullYear() + "-" + dt.getMonth(); };
+function payDayFor(y, m){
+  const o = (S.payOverrides || {})[payKey(y, m)];
+  return o != null ? o : new Date(y, m, paydayNum()).getTime();
+}
 function periodFor(t){
   const now = new Date(t);
-  const d = Math.min(28, Math.max(1, (S.settings.payday | 0) || 1));
   let y = now.getFullYear(), m = now.getMonth();
-  if (now.getDate() < d) m -= 1;
-  return { start:new Date(y, m, d).getTime(), end:new Date(y, m + 1, d).getTime() };
+  if (now.getDate() < paydayNum()) m -= 1;
+  let start = payDayFor(y, m), end = payDayFor(y, m + 1);
+  if (t >= end){ start = end; end = payDayFor(y, m + 2); }
+  return { start, end };
 }
 const billsTotal = () => sum(S.bills, b => b.amount);
 const inPeriod = (t, p) => t >= p.start && t < p.end;
@@ -385,12 +394,17 @@ function balances(){
   let bank = b.bank, sav = b.savings, changes = 0;
   S.tx.forEach(t => { if (t.ts > b.ts){ bank -= t.amt; if (t.kind === "goal") sav += t.amt; changes++; } });
   (S.income || []).forEach(x => { if (x.ts > b.ts){ bank += x.amt - (x.saved || 0); sav += (x.saved || 0); changes++; } });
-  const today = sod(Date.now()), payday = Math.min(28, Math.max(1, S.settings.payday | 0 || 1));
+  const today = sod(Date.now());
   for (let day = addDays(sod(b.ts), 1), n = 0; day <= today && n < 800; day = addDays(day, 1), n++){
     const dt = new Date(day), date = dt.getDate(), last = new Date(dt.getFullYear(), dt.getMonth() + 1, 0).getDate();
-    if (date === payday){ bank += S.settings.income - S.settings.savingsTarget; sav += S.settings.savingsTarget; changes++; }
+    // scheduled paydays only; early paydays are counted below from the moment "I got paid today" was tapped
+    if ((S.payOverrides || {})[payKey(dt.getFullYear(), dt.getMonth())] == null && new Date(dt.getFullYear(), dt.getMonth(), paydayNum()).getTime() === day){ bank += S.settings.income - S.settings.savingsTarget; sav += S.settings.savingsTarget; changes++; }
     S.bills.forEach(bl => { if (Math.min(last, bl.day | 0 || 1) === date){ bank -= bl.amount; changes++; } });
   }
+  Object.keys(S.payOverrides || {}).forEach(k => {
+    const tap = (S.payTaps || {})[k] ?? S.payOverrides[k];
+    if (tap > b.ts && tap <= Date.now()){ bank += S.settings.income - S.settings.savingsTarget; sav += S.settings.savingsTarget; changes++; }
+  });
   return { bank:r2(bank), savings:r2(sav), ts:b.ts, changes };
 }
 
@@ -482,7 +496,16 @@ function renderToday(c){
   const periodPct = c.P > 0 ? Math.min(100, Math.max(0, c.spent / c.P * 100)) : 100;
   const periodState = c.spent / c.P > c.elapsed + 0.1 ? "bad" : c.spent / c.P > c.elapsed ? "warn" : "";
 
-  return `
+  const endDt = new Date(c.p.end);
+  const earlyCard = c.daysLeft <= 4 ? `<section class="card" style="border-color:var(--accent)">
+    <div class="section-head"><h2>Paid early?</h2><span class="muted small">payday is ${c.daysLeft===1?"tomorrow":"in "+c.daysLeft+" days"}</span></div>
+    <p class="muted small" style="margin:-4px 0 12px">If your salary is already in your account, start the new month now and get a fresh daily number.</p>
+    <button class="btn primary block" data-act="paid-today" data-key="${payKey(endDt.getFullYear(), endDt.getMonth())}">I got paid today</button>
+  </section>` : "";
+  const earlyKey = Object.keys(S.payOverrides || {}).find(k => S.payOverrides[k] === c.p.start);
+  const undoEarly = earlyKey && (() => { const [yy, mm] = earlyKey.split("-").map(Number); return Date.now() < new Date(yy, mm, paydayNum()).getTime(); })()
+    ? `<div class="hint small" style="margin:0;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap"><span>New month started early on ${fmtDay(c.p.start).toLowerCase()}.</span><button class="link" style="font-size:13px" data-act="undo-paid" data-key="${earlyKey}">Not paid yet? Undo</button></div>` : "";
+  return `${earlyCard}${undoEarly}
   <section class="hero" aria-label="Safe to spend today">
     <div class="hero-top"><span class="label">Safe to spend today</span><span class="chip ${state}"><i></i>${label}</span></div>
     <div class="big num ${c.safe<0?"bad":""}">${c.safe<0?"−":""}${money(Math.abs(c.safe))}</div>
@@ -1295,6 +1318,18 @@ document.addEventListener("click", e => {
   if (d.act === "want") return sheetWant();
   if (d.act === "catchup") return sheetCatchup();
   if (d.act === "balances") return sheetBalances();
+  if (d.act === "paid-today"){
+    if (!S.payOverrides) S.payOverrides = {};
+    S.payOverrides[d.key] = sod(Date.now());
+    if (!S.payTaps) S.payTaps = {};
+    S.payTaps[d.key] = Date.now();
+    commit("New month started. Here's your fresh daily number."); window.scrollTo(0,0); return;
+  }
+  if (d.act === "undo-paid"){
+    if (S.payOverrides) delete S.payOverrides[d.key];
+    if (S.payTaps) delete S.payTaps[d.key];
+    commit("Undone. Back to waiting for payday."); return;
+  }
   if (d.act === "income") return sheetIncome();
   if (d.delInc){
     if (!t.classList.contains("confirm")){ t.classList.add("confirm"); t.textContent = "Sure?"; setTimeout(() => { if (t.isConnected){ t.classList.remove("confirm"); t.textContent = "Delete"; } }, 3000); return; }
